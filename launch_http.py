@@ -15,15 +15,25 @@ in front of it must enforce a bearer token. Do not set HOMEBOX_MCP_HOST to
 0.0.0.0.
 
 Environment:
-    HOMEBOX_MCP_HOST   bind address (default 127.0.0.1)
-    HOMEBOX_MCP_PORT   bind port (default 3003)
+    HOMEBOX_MCP_HOST           bind address (default 127.0.0.1)
+    HOMEBOX_MCP_PORT           bind port (default 3003)
+    HOMEBOX_MCP_PUBLIC_HOST    public Host header the proxy forwards, e.g.
+                               ``mcp.example.com``. Comma-separated for several.
+                               Required when a proxy fronts the server — see below.
     plus everything homebox_mcp.py itself reads (HOMEBOX_URL, HOMEBOX_TOKEN)
+
+DNS-rebinding protection stays **on**. FastMCP enables it automatically for a
+loopback bind and then only accepts ``Host: 127.0.0.1``/``localhost``, so every
+request arriving through a proxy is rejected with ``421 Invalid Host header``.
+The fix is to allowlist the public name rather than to disable the check.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+
+from mcp.server.transport_security import TransportSecuritySettings
 
 from homebox_mcp import mcp
 
@@ -39,8 +49,22 @@ def main() -> None:
         )
         raise SystemExit(2)
 
+    allowed_hosts = ["127.0.0.1", f"127.0.0.1:{port}", "localhost", f"localhost:{port}"]
+    allowed_origins: list[str] = []
+    for name in os.environ.get("HOMEBOX_MCP_PUBLIC_HOST", "").split(","):
+        name = name.strip()
+        if not name:
+            continue
+        allowed_hosts += [name, f"{name}:*"]
+        allowed_origins += [f"https://{name}", f"https://{name}:*"]
+
     mcp.settings.host = host
     mcp.settings.port = port
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
     mcp.run(transport="streamable-http")
 
 
