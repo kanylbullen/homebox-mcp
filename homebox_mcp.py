@@ -1719,9 +1719,15 @@ def finalize_photos() -> dict:
 @_tool_errors
 def barcode_lookup(code: str) -> dict:
     """Look up a UPC/EAN barcode → name/manufacturer/model (optional path for
-    boxed goods). Thin wrapper over GET /products/search-from-barcode."""
+    boxed goods). Thin wrapper over GET /products/search-from-barcode.
+
+    The query parameter is `productEAN`. Homebox's own swagger annotation on
+    this route documents it as `data`, which is wrong: the handler binds
+    `schema:"productEAN"`, and any other name is rejected by the schema decoder
+    with a 500 `{"error":"Unknown Error"}` that never mentions the parameter.
+    """
     try:
-        return {"ok": True, "result": _get("/products/search-from-barcode", data=code)}
+        return {"ok": True, "result": _get("/products/search-from-barcode", productEAN=code)}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"barcode lookup failed: {exc}"}
 
@@ -1768,7 +1774,16 @@ def log_maintenance(
     """Add a maintenance-log entry to an item (assetId / alias field / exact
     name) — e.g. "changed the mower oil today" (completed_date) or "sharpen
     blades in spring" (scheduled_date). Dates are YYYY-MM-DD; `cost` is a
-    number. Returns the new entry's id."""
+    number. **One of completed_date or scheduled_date is required.** Returns
+    the new entry's id."""
+    if not completed_date and not scheduled_date:
+        # The API enforces this, but answers with a bare 500 "Unknown Error";
+        # the useful message ("either completedDate or scheduledDate must be
+        # set") only ever reaches the server log. Since neither date is a
+        # required parameter, a caller reading the schema will otherwise
+        # produce a call that cannot succeed.
+        return {"error": "pass completed_date (work already done) or "
+                         "scheduled_date (work planned) — YYYY-MM-DD"}
     full, err = _resolve_exact(identifier)
     if err:
         return {"error": err}
