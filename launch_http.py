@@ -33,6 +33,8 @@ Environment:
     HOMEBOX_MCP_PUBLIC_HOST     public Host header(s) the proxy forwards, comma-separated
     HOMEBOX_MCP_BEARER          static bearer token; required for a non-loopback bind
     HOMEBOX_MCP_EXCLUDE_TOOLS   comma-separated tool names to unregister
+    HOMEBOX_MCP_RATE_LIMIT      requests per window per client (0 = off, the default)
+    HOMEBOX_MCP_RATE_WINDOW     window in seconds (default 60)
     plus everything homebox_mcp.py itself reads (HOMEBOX_URL, HOMEBOX_TOKEN)
 """
 
@@ -41,12 +43,84 @@ from __future__ import annotations
 import hmac
 import os
 import sys
+import time
+from collections import OrderedDict, deque
 
 from mcp.server.transport_security import TransportSecuritySettings
 
 from homebox_mcp import mcp
 
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+# Cap on distinct clients tracked by the rate limiter. Without it, an attacker
+# rotating source addresses grows the table without bound — turning the defence
+# into the memory-exhaustion vector.
+RATE_MAX_TRACKED = 4096
+
+
+class RateLimit:
+    """Sliding-window per-client rate limit.
+
+    Keys on the client address, read from ``CF-Connecting-IP`` when present and
+    otherwise from the socket peer.
+
+    That header choice matters. Behind a tunnel or reverse proxy every request
+    arrives from the connector's own address, so keying on the socket peer puts
+    every client in **one shared bucket** — legitimate users then throttle each
+    other while an attacker still gets the full allowance. The header is only
+    trustworthy because nothing but the connector can reach this port; if that
+    stops being true, this becomes spoofable and the limit becomes worthless.
+    """
+
+    def __init__(self, app, limit: int, window: float) -> None:
+        self.app = app
+        self.limit = limit
+        self.window = window
+        self.hits: OrderedDict[str, deque[float]] = OrderedDict()
+
+    def _client(self, scope) -> str:
+        headers = dict(scope.get("headers") or [])
+        fwd = headers.get(b"cf-connecting-ip") or headers.get(b"x-forwarded-for")
+        if fwd:
+            return fwd.decode("latin-1").split(",")[0].strip()
+        peer = scope.get("client")
+        return peer[0] if peer else "unknown"
+
+    def _allow(self, key: str, now: float) -> bool:
+        bucket = self.hits.get(key)
+        if bucket is None:
+            if len(self.hits) >= RATE_MAX_TRACKED:
+                self.hits.popitem(last=False)
+            bucket = self.hits[key] = deque()
+        else:
+            self.hits.move_to_end(key)
+        cutoff = now - self.window
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= self.limit:
+            return False
+        bucket.append(now)
+        return True
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if not self._allow(self._client(scope), time.monotonic()):
+            retry = str(int(self.window)).encode()
+            await send({
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"retry-after", retry),
+                ],
+            })
+            await send({"type": "http.response.body", "body": b'{"error":"rate limited"}'})
+            return
+
+        await self.app(scope, receive, send)
 
 
 class BearerGate:
@@ -143,12 +217,17 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(
-        BearerGate(mcp.streamable_http_app(), bearer),
-        host=host,
-        port=port,
-        log_level=mcp.settings.log_level.lower(),
-    )
+    app = BearerGate(mcp.streamable_http_app(), bearer)
+
+    limit = int(os.environ.get("HOMEBOX_MCP_RATE_LIMIT", "0"))
+    if limit > 0:
+        window = float(os.environ.get("HOMEBOX_MCP_RATE_WINDOW", "60"))
+        # Outside the bearer gate on purpose: unauthenticated hammering is
+        # exactly what needs throttling, and it must not be free.
+        app = RateLimit(app, limit, window)
+        sys.stderr.write(f"launch_http: rate limit {limit} req / {window:g}s per client\n")
+
+    uvicorn.run(app, host=host, port=port, log_level=mcp.settings.log_level.lower())
 
 
 if __name__ == "__main__":
